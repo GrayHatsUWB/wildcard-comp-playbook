@@ -13,6 +13,8 @@
 #   --fix            Apply safe fixes. Prompts before each change.
 #                    Backs up every modified file to <file>.cpbak-<TS>
 #                    and logs every action to the action log.
+#   --fix-safe       Apply the same safe fixes automatically without prompts.
+#                    Uses the same backup + action log + rollback flow.
 #   --rollback       Reverse the most recent --fix run.
 #   --rollback-all   Reverse every recorded --fix action, newest first.
 #   --list-backups   Show recorded actions / backups.
@@ -42,7 +44,7 @@ shopt -s nullglob
 # Globals
 ############################################################
 
-CP_AUDIT_VERSION="2.1"
+CP_AUDIT_VERSION="2.2"
 TS="$(date +%Y%m%d-%H%M%S)"
 RUN_TS="$TS"
 SCRIPT_NAME="$(basename "$0")"
@@ -113,6 +115,7 @@ ${C_BOLD}$SCRIPT_NAME${C_RESET} v$CP_AUDIT_VERSION  -  Comprehensive CyberPatrio
 Usage:
   $SCRIPT_NAME                  Audit only (read-only). Default.
   $SCRIPT_NAME --fix            Apply safe fixes (prompts before each change).
+  $SCRIPT_NAME --fix-safe       Apply safe fixes automatically (no prompts).
   $SCRIPT_NAME --rollback       Reverse the most recent --fix run.
   $SCRIPT_NAME --rollback-all   Reverse every recorded fix, newest first.
   $SCRIPT_NAME --list-backups   List recorded actions / backups.
@@ -248,6 +251,10 @@ backup_file() {
 
 confirm() {
     local prompt="$1"
+    if [[ "$MODE" == "fix-safe" ]]; then
+        note "auto-fix: $prompt"
+        return 0
+    fi
     if [[ "$MODE" != "fix" ]]; then return 1; fi
     local ans
     read -r -p "  ${C_BOLD}${C_MAGENTA}FIX?${C_RESET} $prompt [y/N] " ans </dev/tty || return 1
@@ -255,7 +262,7 @@ confirm() {
 }
 
 need_root_for_fix() {
-    if [[ "$MODE" == "fix" && $EUID -ne 0 ]]; then
+    if [[ ( "$MODE" == "fix" || "$MODE" == "fix-safe" ) && $EUID -ne 0 ]]; then
         warn "Skipping fix (need root)."
         return 1
     fi
@@ -385,11 +392,157 @@ find_and_parse_readme() {
 }
 
 ############################################################
+# Helpers
+############################################################
+
+show_hidden_line_issues() {
+    local file="$1" label="${2:-$1}"
+    [[ -r "$file" ]] || return 0
+    local hits
+    hits="$(LC_ALL=C grep -nP '[[:cntrl:]]|[[:space:]]+$' "$file" 2>/dev/null || true)"
+    if [[ -z "$hits" ]]; then
+        ok "$label has no control chars or trailing whitespace."
+    else
+        bad "$label contains control chars and/or trailing whitespace:"
+        sed -n 'l' "$file" 2>/dev/null | grep -n '\\r\|\\t\| \$' | head -40 | sed 's/^/         /'
+    fi
+}
+
+show_trimmed_diff() {
+    local raw="$1"
+    printf '%s' "$raw" | sed 's/[[:space:]]\+$//'
+}
+
+############################################################
+# CHECKS - System information / privesc exposure
+############################################################
+
+check_system_info_exposure() {
+    hdr "System information and exposure"
+
+    sub "PATH directories"
+    local path_dir
+    IFS=':' read -r -a path_parts <<< "${PATH:-}"
+    for path_dir in "${path_parts[@]}"; do
+        [[ -n "$path_dir" && -d "$path_dir" ]] || continue
+        local mode owner
+        mode="$(stat -c '%a' "$path_dir" 2>/dev/null)"
+        owner="$(stat -c '%U' "$path_dir" 2>/dev/null)"
+        if [[ "$mode" =~ .[2367]$ ]]; then
+            bad "PATH dir writable by others: $path_dir (mode=$mode owner=$owner)"
+        else
+            note "$path_dir mode=$mode owner=$owner"
+        fi
+    done
+
+    sub "Sensitive environment variables"
+    env | grep -E '^(PATH|LD_|PYTHONPATH|PYTHONHOME|PERL5LIB|RUBYLIB|GEM_PATH|BASH_ENV|ENV|SUDO_|XDG_RUNTIME_DIR)=' | sed 's/^/         /'
+
+    sub "Shell history and prompt env"
+    env | grep -E '^(HISTFILE|HISTFILESIZE|HISTSIZE|HISTCONTROL|PROMPT_COMMAND|PS1|SHELL|TERM|DISPLAY|EDITOR|HOME|USER|MAIL|TZ)=' | sed 's/^/         /'
+    if [[ "${HISTFILESIZE:-}" == "0" ]]; then
+        bad "HISTFILESIZE=0 (history truncation disabled persistence of shell history)"
+    fi
+    if [[ "${HISTSIZE:-}" == "0" ]]; then
+        bad "HISTSIZE=0 (commands not retained in shell history)"
+    fi
+    if [[ "${HISTCONTROL:-}" =~ ignore ]]; then
+        warn "HISTCONTROL='${HISTCONTROL}' can suppress history entries."
+    fi
+    if [[ -n "${PROMPT_COMMAND:-}" ]]; then
+        warn "PROMPT_COMMAND is set: ${PROMPT_COMMAND}"
+    fi
+
+    sub "Proxy and trust-store env"
+    env | grep -iE '^(http|https|ftp|all|no)_proxy=|^(HTTP|HTTPS|FTP|ALL|NO)_PROXY=|^SSL_CERT_FILE=|^SSL_CERT_DIR=' | sed 's/^/         /'
+    [[ -n "${SSL_CERT_FILE:-}" ]] && warn "SSL_CERT_FILE overrides system trust store."
+    [[ -n "${SSL_CERT_DIR:-}" ]] && warn "SSL_CERT_DIR overrides certificate directory."
+
+    sub "/etc/fstab"
+    if [[ -r /etc/fstab ]]; then
+        local fstab_hits
+        fstab_hits="$(grep -vE '^\s*(#|$)' /etc/fstab 2>/dev/null || true)"
+        [[ -n "$fstab_hits" ]] && echo "$fstab_hits" | sed 's/^/         /'
+        if grep -qiE 'password=|passwd=|username=|user=' /etc/fstab 2>/dev/null; then
+            bad "/etc/fstab appears to contain credentials."
+        else
+            ok "/etc/fstab has no obvious inline credentials."
+        fi
+    fi
+
+    sub "Mounted filesystems"
+    if command -v findmnt >/dev/null 2>&1; then
+        findmnt -rn -o TARGET,SOURCE,FSTYPE,OPTIONS 2>/dev/null | head -40 | sed 's/^/         /'
+    else
+        mount 2>/dev/null | head -40 | sed 's/^/         /'
+    fi
+
+    sub "Current and parent process environments"
+    tr '\0' '\n' </proc/$$/environ 2>/dev/null | grep -E '^(PATH|LD_|PYTHONPATH|BASH_ENV|ENV|HIST|http_proxy|https_proxy|all_proxy|no_proxy|SSL_CERT_|PROMPT_COMMAND|PS1)=' | sed 's/^/         /'
+    local ppid
+    ppid="$(ps -o ppid= -p $$ 2>/dev/null | xargs)"
+    if [[ -n "$ppid" && -r "/proc/$ppid/environ" ]]; then
+        tr '\0' '\n' <"/proc/$ppid/environ" 2>/dev/null | grep -E '^(PATH|LD_|PYTHONPATH|BASH_ENV|ENV|HIST|http_proxy|https_proxy|all_proxy|no_proxy|SSL_CERT_|PROMPT_COMMAND|PS1)=' | sed 's/^/         /'
+    fi
+
+    sub "/proc mount options"
+    local proc_mount
+    proc_mount="$(grep ' /proc ' /proc/mounts 2>/dev/null || true)"
+    if [[ -n "$proc_mount" ]]; then
+        info "$proc_mount"
+        if echo "$proc_mount" | grep -q 'hidepid='; then
+            ok "/proc uses hidepid."
+        else
+            warn "/proc does not use hidepid."
+        fi
+    fi
+
+    sub "Useful tooling present"
+    local useful
+    useful="$(command -v nmap aws nc ncat netcat wget curl ping gcc g++ make gdb base64 socat python python2 python3 perl php ruby xterm doas sudo docker lxc ctr runc kubectl 2>/dev/null || true)"
+    if [[ -n "$useful" ]]; then
+        echo "$useful" | sed 's/^/         /'
+    fi
+
+    sub "Kernel and sudo quick risk context"
+    info "kernel: $(uname -r 2>/dev/null)"
+    if command -v sudo >/dev/null 2>&1; then
+        info "sudo: $(sudo -V 2>/dev/null | head -1)"
+    fi
+    if [[ -r /proc/sys/kernel/randomize_va_space ]]; then
+        info "ASLR: $(cat /proc/sys/kernel/randomize_va_space 2>/dev/null)"
+    fi
+    if command -v sestatus >/dev/null 2>&1; then
+        info "SELinux: $(sestatus 2>/dev/null | head -3 | tr '\n' '; ')"
+    fi
+    if uname -r 2>/dev/null | grep -q '\-grsec'; then
+        info "grsecurity kernel string detected."
+    fi
+
+    sub "Container indicators"
+    local container=0
+    [[ -f /.dockerenv || -f /run/.containerenv ]] && container=1
+    grep -qaE '(docker|kubepods|containerd|lxc)' /proc/1/cgroup 2>/dev/null && container=1
+    if (( container )); then
+        warn "Container indicators detected."
+    else
+        ok "No obvious container indicators detected."
+    fi
+}
+
+############################################################
 # CHECKS - Users / Sudo / Auth
 ############################################################
 
 check_users_and_admins() {
     hdr "Users and administrators"
+
+    sub "Hidden characters / trailing whitespace in auth files"
+    local af
+    for af in /etc/passwd /etc/shadow /etc/group /etc/gshadow; do
+        [[ -e "$af" ]] || continue
+        show_hidden_line_issues "$af"
+    done
 
     sub "Immutable bit on auth files (chattr +i blocks all edits)"
     if command -v lsattr >/dev/null; then
@@ -520,6 +673,32 @@ check_users_and_admins() {
     rootshell="$(awk -F: '$1=="root" {print $7}' /etc/passwd)"
     info "root shell: $rootshell"
 
+    sub "Login shells not listed in /etc/shells"
+    if [[ -r /etc/shells ]]; then
+        local bad_shells=""
+        while IFS=: read -r u _ uid _ _ _ shell; do
+            [[ -n "$shell" ]] || continue
+            local trimmed
+            trimmed="$(show_trimmed_diff "$shell")"
+            [[ "$trimmed" == "/usr/sbin/nologin" || "$trimmed" == "/sbin/nologin" || "$trimmed" == "/bin/false" ]] && continue
+            if [[ "$trimmed" != "$shell" ]]; then
+                bad_shells+="$u:shell has trailing/hidden whitespace: '$(printf '%q' "$shell")'"$'\n'
+                continue
+            fi
+            if ! grep -qxF "$trimmed" /etc/shells 2>/dev/null; then
+                bad_shells+="$u:$trimmed"$'\n'
+            fi
+        done < /etc/passwd
+        if [[ -z "$bad_shells" ]]; then
+            ok "All active login shells are listed in /etc/shells."
+        else
+            bad "Accounts with non-standard shells:"
+            echo "$bad_shells" | sed '/^$/d; s/^/         /'
+        fi
+    else
+        warn "/etc/shells not readable."
+    fi
+
     info "Cross-check users / admins against the README."
 }
 
@@ -598,6 +777,84 @@ check_sudoers() {
             info "No explicit sudo disable_coredump setting found. Default is usually safe, but scoring may expect an explicit directive."
         fi
     fi
+
+    sub "sudo rule surface"
+    if command -v sudo >/dev/null 2>&1; then
+        info "sudo version: $(sudo -V 2>/dev/null | head -1)"
+        local sudo_list
+        sudo_list="$(sudo -n -l 2>/dev/null || true)"
+        if [[ -n "$sudo_list" ]]; then
+            warn "sudo -n -l returned runnable rule information:"
+            echo "$sudo_list" | sed 's/^/         /'
+        else
+            info "sudo -n -l unavailable without a password or no cached token."
+        fi
+    fi
+
+    sub "Additional sudo env risks"
+    hits="$(grep -RInE '^[[:space:]]*Defaults.*env_keep.*(BASH_ENV|ENV|PATH)' /etc/sudoers /etc/sudoers.d/ 2>/dev/null || true)"
+    if [[ -n "$hits" ]]; then
+        bad "sudo keeps risky environment variables:"
+        echo "$hits" | sed 's/^/         /'
+    else
+        ok "sudo does not keep BASH_ENV/ENV/PATH via env_keep."
+    fi
+    hits="$(grep -RInE '^[[:space:]]*Defaults.*!env_reset' /etc/sudoers /etc/sudoers.d/ 2>/dev/null || true)"
+    if [[ -n "$hits" ]]; then
+        warn "sudo disables env_reset:"
+        echo "$hits" | sed 's/^/         /'
+    fi
+    hits="$(grep -RInE '^[[:space:]]*Defaults.*(requiretty|!requiretty|secure_path)' /etc/sudoers /etc/sudoers.d/ 2>/dev/null || true)"
+    if [[ -n "$hits" ]]; then
+        info "sudo tty/path-related defaults:"
+        echo "$hits" | sed 's/^/         /'
+    fi
+    hits="$(grep -RInE '^[[:space:]]*.*SETENV:' /etc/sudoers /etc/sudoers.d/ 2>/dev/null || true)"
+    if [[ -n "$hits" ]]; then
+        warn "SETENV sudo rules present:"
+        echo "$hits" | sed 's/^/         /'
+    fi
+
+    sub "/etc/sudoers.d permissions"
+    if [[ -d /etc/sudoers.d ]]; then
+        local perms
+        perms="$(find /etc/sudoers.d -maxdepth 1 \( -type f -o -type d \) -writable 2>/dev/null || true)"
+        if [[ -z "$perms" ]]; then
+            ok "No writable entries in /etc/sudoers.d."
+        else
+            bad "Writable sudoers entries found:"
+            echo "$perms" | sed 's/^/         /'
+        fi
+        if command -v getfacl >/dev/null 2>&1; then
+            local sf acl_hits=""
+            for sf in /etc/sudoers /etc/sudoers.d/*; do
+                [[ -e "$sf" ]] || continue
+                if getfacl -cp "$sf" 2>/dev/null | grep -qE '^user:[^:]+:rw|^group:[^:]+:rw'; then
+                    acl_hits+="$sf"$'\n'
+                fi
+            done
+            if [[ -z "$acl_hits" ]]; then
+                ok "No obvious writable ACLs on sudoers files."
+            else
+                bad "Writable ACLs detected on sudoers files:"
+                echo "$acl_hits" | sed '/^$/d; s/^/         /'
+            fi
+        fi
+    fi
+
+    sub "sudo timestamp tokens"
+    local ts_dir
+    for ts_dir in /run/sudo/ts /var/run/sudo/ts; do
+        [[ -d "$ts_dir" ]] || continue
+        info "$ts_dir:"
+        ls -la "$ts_dir" 2>/dev/null | sed 's/^/         /'
+        local tsw
+        tsw="$(find "$ts_dir" -maxdepth 1 -writable 2>/dev/null || true)"
+        if [[ -n "$tsw" ]]; then
+            warn "Writable sudo timestamp entries:"
+            echo "$tsw" | sed 's/^/         /'
+        fi
+    done
 }
 
 check_password_policy() {
@@ -635,6 +892,37 @@ check_password_policy() {
             fi
         fi
     done
+
+    sub "Password hash algorithms in /etc/shadow"
+    if [[ -r /etc/shadow ]]; then
+        local hash_summary
+        hash_summary="$(
+            awk -F: '
+                function classify(h) {
+                    if (h == "" || h == "!" || h == "*" || h ~ /^![^$]/) return "locked_or_empty";
+                    if (h ~ /^\$y\$/) return "yescrypt";
+                    if (h ~ /^\$6\$/) return "sha512crypt";
+                    if (h ~ /^\$5\$/) return "sha256crypt";
+                    if (h ~ /^\$2[aby]\$/) return "bcrypt";
+                    if (h ~ /^\$1\$/) return "md5crypt";
+                    if (h ~ /^[A-Za-z0-9.\/]{13}$/) return "des_or_legacy";
+                    return "other";
+                }
+                { c[classify($2)]++ }
+                END {
+                    for (k in c) print k ":" c[k];
+                }
+            ' /etc/shadow 2>/dev/null | sort
+        )"
+        if [[ -n "$hash_summary" ]]; then
+            echo "$hash_summary" | sed 's/^/         /'
+            echo "$hash_summary" | grep -qE '^(md5crypt|des_or_legacy):' && bad "Legacy password hash formats present in /etc/shadow"
+            echo "$hash_summary" | grep -q '^yescrypt:' && ok "yescrypt hashes present"
+            echo "$hash_summary" | grep -q '^sha512crypt:' && ok "sha512crypt hashes present"
+        else
+            info "Could not summarize /etc/shadow hash formats."
+        fi
+    fi
 }
 
 check_pam() {
@@ -811,6 +1099,28 @@ check_sshd() {
         echo "$accept_env" | sed 's/^/         /'
     fi
 
+    sub "AuthorizedKeysFile"
+    local akf
+    akf="$(grep -iE '^[[:space:]]*AuthorizedKeysFile[[:space:]]' "$f" 2>/dev/null || true)"
+    if [[ -n "$akf" ]]; then
+        info "AuthorizedKeysFile directives:"
+        echo "$akf" | sed 's/^/         /'
+    fi
+
+    sub "Agent forwarding"
+    local agent_fw
+    agent_fw="$(grep -iE '^[[:space:]]*AllowAgentForwarding[[:space:]]' "$f" 2>/dev/null || true)"
+    if [[ -n "$agent_fw" ]]; then
+        info "AllowAgentForwarding:"
+        echo "$agent_fw" | sed 's/^/         /'
+    fi
+
+    sub "SSH login control files"
+    for lf in /etc/nologin /etc/motd /etc/issue /etc/issue.net; do
+        [[ -f "$lf" ]] || continue
+        info "$lf ($(stat -c '%s' "$lf" 2>/dev/null) bytes)"
+    done
+
     info "(SSH service is NOT restarted automatically. After review:  systemctl reload sshd)"
 }
 
@@ -857,6 +1167,8 @@ check_firewall() {
         found_firewall="${found_firewall:+$found_firewall, }firewalld"
         if systemctl is-active --quiet firewalld 2>/dev/null; then
             ok "firewalld is active."
+            sub "firewalld zones"
+            firewall-cmd --list-all-zones 2>/dev/null | sed 's/^/         /'
         else
             bad "firewalld is installed but not active."
             if confirm "Enable & start firewalld ?"; then
@@ -913,6 +1225,8 @@ check_sysctl() {
         [net.ipv4.ip_forward]="0"
         [net.ipv4.conf.all.log_martians]="1"
         [net.ipv4.conf.default.log_martians]="1"
+        [net.ipv4.conf.all.proxy_arp]="0"
+        [net.ipv4.conf.default.proxy_arp]="0"
         [net.ipv4.conf.all.accept_redirects]="0"
         [net.ipv4.conf.default.accept_redirects]="0"
         [net.ipv4.conf.all.secure_redirects]="0"
@@ -1122,6 +1436,43 @@ check_no_owner() {
     fi
 }
 
+check_capabilities_and_acls() {
+    hdr "Capabilities and ACLs"
+
+    sub "File capabilities"
+    if command -v getcap >/dev/null 2>&1; then
+        local caps
+        caps="$(getcap -r / 2>/dev/null | head -80 || true)"
+        if [[ -z "$caps" ]]; then
+            ok "No file capabilities reported."
+        else
+            warn "Files with capabilities:"
+            echo "$caps" | sed 's/^/         /'
+        fi
+    else
+        info "getcap not installed."
+    fi
+
+    sub "Non-trivial ACLs"
+    if command -v getfacl >/dev/null 2>&1; then
+        local acl_hits=""
+        while IFS= read -r f; do
+            [[ -e "$f" ]] || continue
+            if getfacl -cp "$f" 2>/dev/null | grep -qE '^user:|^group:'; then
+                acl_hits+="$f"$'\n'
+            fi
+        done < <(find /etc /usr/local/bin /usr/local/sbin /home -xdev \( -type f -o -type d \) 2>/dev/null | head -400)
+        if [[ -z "$acl_hits" ]]; then
+            info "No sampled ACL anomalies found."
+        else
+            warn "Files/directories with ACL entries in sampled paths:"
+            echo "$acl_hits" | sed '/^$/d; s/^/         /'
+        fi
+    else
+        info "getfacl not installed."
+    fi
+}
+
 ############################################################
 # CHECKS - Services / packages
 ############################################################
@@ -1135,6 +1486,31 @@ check_services() {
           | awk '{print "         " $1}'
     fi
 
+    sub "Remote access services"
+    local remote_hits=""
+    if command -v systemctl >/dev/null; then
+        remote_hits="$(systemctl list-unit-files --type=service --no-legend 2>/dev/null \
+            | awk '{print $1}' | grep -iE 'ssh|sshd|xrdp|vnc|vino|teamviewer|anydesk|remmina|gnome-remote-desktop|x11vnc|tigervnc|rustdesk|wayvnc|x2go|guacd|guacamole' || true)"
+    fi
+    if [[ -z "$remote_hits" ]]; then
+        ok "No obviously remote-access-related service units found."
+    else
+        warn "Remote-access-related service units present:"
+        echo "$remote_hits" | sed 's/^/         /'
+    fi
+
+    sub "Core session services"
+    local svc
+    for svc in dbus systemd-logind; do
+        if command -v systemctl >/dev/null && systemctl list-unit-files 2>/dev/null | grep -q "^${svc}\.service"; then
+            if systemctl is-active --quiet "$svc" 2>/dev/null; then
+                ok "$svc.service is active."
+            else
+                warn "$svc.service exists but is not active."
+            fi
+        fi
+    done
+
     sub "Listening sockets"
     if command -v ss >/dev/null; then
         ss -tulnp 2>/dev/null | awk 'NR>1 {print "         " $0}'
@@ -1145,6 +1521,80 @@ check_services() {
     sub "Processes (top 30 by CPU)"
     ps -eo pid,user,%cpu,%mem,cmd --sort=-%cpu 2>/dev/null | head -30 | awk '{print "         " $0}'
 
+    sub "Processes with debug/inspect flags"
+    local dbg
+    dbg="$(ps -ef 2>/dev/null | grep -E -- '--inspect|--remote-debugging-port|--remote-debugging-address|node.*inspect|cef' | grep -v grep || true)"
+    if [[ -z "$dbg" ]]; then
+        ok "No obvious debug/inspect processes found."
+    else
+        warn "Debuggable process flags detected:"
+        echo "$dbg" | sed 's/^/         /'
+    fi
+
+    sub "Cross-user parent/child chains"
+    local chains
+    chains="$(ps -eo pid=,ppid=,user=,comm= --no-headers 2>/dev/null | awk '
+        { pid[$1]=$1; ppid[$1]=$2; user[$1]=$3; comm[$1]=$4; line[$1]=$0 }
+        END {
+            for (p in pid) {
+                if (ppid[p] in user && user[p] != user[ppid[p]]) {
+                    print "child=" line[p] " | parent=" line[ppid[p]]
+                }
+            }
+        }' | head -40)"
+    if [[ -z "$chains" ]]; then
+        info "No sampled cross-user parent/child chains found."
+    else
+        warn "Cross-user parent/child chains (triage):"
+        echo "$chains" | sed 's/^/         /'
+    fi
+
+    sub "Process name vs executable path"
+    local mismatch
+    mismatch="$(
+        for p in /proc/[0-9]*; do
+            [[ -r "$p/status" ]] || continue
+            local_name="$(awk '/^Name:/ {print $2}' "$p/status" 2>/dev/null)"
+            exe="$(readlink "$p/exe" 2>/dev/null || true)"
+            cmd="$(tr '\0' ' ' <"$p/cmdline" 2>/dev/null | sed 's/[[:space:]]\+$//')"
+            [[ -n "$exe" && -n "$local_name" ]] || continue
+            base="$(basename "$exe")"
+            if [[ "$base" != "$local_name" ]]; then
+                printf '%s | name=%s | exe=%s | cmd=%s\n' "${p##*/}" "$local_name" "$exe" "$cmd"
+            fi
+        done | head -60
+    )"
+    if [[ -z "$mismatch" ]]; then
+        info "No sampled process-name/executable mismatches found."
+    else
+        warn "Process name does not match executable basename:"
+        echo "$mismatch" | sed 's/^/         /'
+    fi
+
+    sub "Deleted executables / deleted-open files"
+    if command -v lsof >/dev/null 2>&1; then
+        local del
+        del="$(lsof +L1 2>/dev/null | head -60 || true)"
+        if [[ -z "$del" ]]; then
+            ok "No deleted-open files reported by lsof +L1."
+        else
+            warn "Deleted-open files/executables present:"
+            echo "$del" | sed 's/^/         /'
+        fi
+    else
+        info "lsof not installed."
+    fi
+
+    sub "Per-process fd symlinks to deleted files"
+    local pdel
+    pdel="$(find /proc/[0-9]*/fd -lname '*deleted*' 2>/dev/null | head -80 || true)"
+    if [[ -z "$pdel" ]]; then
+        ok "No deleted fd symlinks found under /proc/*/fd in sampled output."
+    else
+        warn "Deleted files still open via /proc/*/fd:"
+        echo "$pdel" | sed 's/^/         /'
+    fi
+
     sub "Netcat / suspicious backdoor processes"
     local hits
     hits="$(ps -ef 2>/dev/null | grep -E '\b(nc|ncat|netcat|socat)\b' | grep -v grep || true)"
@@ -1152,6 +1602,15 @@ check_services() {
         ok "No netcat/socat processes running."
     else
         echo "$hits" | while read -r line; do bad "BACKDOOR?: $line"; done
+    fi
+
+    sub "Restricted shells in use"
+    hits="$(ps -ef 2>/dev/null | grep -E '(^|/)(rbash|rksh|rzsh)([[:space:]]|$)' | grep -v grep || true)"
+    if [[ -z "$hits" ]]; then
+        ok "No restricted-shell processes observed."
+    else
+        warn "Restricted shells are running:"
+        echo "$hits" | sed 's/^/         /'
     fi
 }
 
@@ -1215,6 +1674,41 @@ check_prohibited_packages() {
         dnf|yum|zypper) rpm -qa 2>/dev/null | grep -iE 'crack|hack' | grep -viE 'libcrack|cracklib' | sed 's/^/         /' || note "(none)" ;;
         pacman) pacman -Qq 2>/dev/null | grep -iE 'crack|hack' | grep -viE 'libcrack|cracklib' | sed 's/^/         /' || note "(none)" ;;
     esac
+
+    sub "Browsers installed"
+    local browser_hits=""
+    case "$PKG_MGR" in
+        apt) browser_hits="$(dpkg-query -W -f='${binary:Package}\n' 2>/dev/null | grep -iE 'firefox|chromium|chrome|brave|opera|vivaldi|epiphany|midori|konqueror|falkon|tor-browser' || true)" ;;
+        dnf|yum|zypper) browser_hits="$(rpm -qa 2>/dev/null | grep -iE 'firefox|chromium|chrome|brave|opera|vivaldi|epiphany|midori|konqueror|falkon|tor-browser' || true)" ;;
+        pacman) browser_hits="$(pacman -Qq 2>/dev/null | grep -iE 'firefox|chromium|chrome|brave|opera|vivaldi|epiphany|midori|konqueror|falkon|tor-browser' || true)" ;;
+    esac
+    if [[ -z "$browser_hits" ]]; then
+        info "No common browser packages found by name."
+    else
+        info "Installed browser-related packages:"
+        echo "$browser_hits" | sed 's/^/         /'
+    fi
+
+    sub "Sandboxed / portable app platforms"
+    for cmd in snap flatpak; do
+        if command -v "$cmd" >/dev/null 2>&1; then
+            warn "$cmd is installed."
+            case "$cmd" in
+                snap) snap list 2>/dev/null | sed 's/^/         /' ;;
+                flatpak) flatpak list 2>/dev/null | sed 's/^/         /' ;;
+            esac
+        else
+            ok "$cmd not installed"
+        fi
+    done
+    local appimages
+    appimages="$(find /home /root /opt -type f -iname '*.AppImage' 2>/dev/null || true)"
+    if [[ -z "$appimages" ]]; then
+        ok "No AppImage files found in common locations."
+    else
+        warn "AppImage files found:"
+        echo "$appimages" | sed 's/^/         /'
+    fi
 }
 
 check_pkg_mgr_config() {
@@ -1295,6 +1789,13 @@ check_pkg_mgr_config() {
             fi
             sub "Repositories"
             ls /etc/yum.repos.d/ 2>/dev/null | sed 's/^/         /'
+            if command -v dnf >/dev/null 2>&1; then
+                sub "dnf repolist --all"
+                dnf repolist --all 2>/dev/null | sed 's/^/         /'
+            elif command -v yum >/dev/null 2>&1; then
+                sub "yum repolist all"
+                yum repolist all 2>/dev/null | sed 's/^/         /'
+            fi
             ;;
         zypper)
             local f=/etc/zypp/zypp.conf
@@ -1435,6 +1936,16 @@ check_scheduled() {
         echo "$cron_hits" | sed 's/^/         /'
     fi
 
+    sub "Hidden control characters in cron files"
+    local cron_ctrl
+    cron_ctrl="$(sed -n 'l' /etc/crontab /etc/cron.d/* 2>/dev/null | grep '\\r' || true)"
+    if [[ -z "$cron_ctrl" ]]; then
+        ok "No carriage-return-hidden cron lines found."
+    else
+        bad "Cron files contain carriage returns / hidden control chars:"
+        echo "$cron_ctrl" | sed 's/^/         /'
+    fi
+
     sub "/etc/cron.{hourly,daily,weekly,monthly}/"
     local d2
     for d2 in /etc/cron.hourly /etc/cron.daily /etc/cron.weekly /etc/cron.monthly; do
@@ -1455,6 +1966,15 @@ check_scheduled() {
     sub "systemd timers"
     if command -v systemctl >/dev/null; then
         systemctl list-timers --no-legend --no-pager 2>/dev/null | head -30 | sed 's/^/         /'
+    fi
+
+    sub "run-parts effective files"
+    if command -v run-parts >/dev/null 2>&1; then
+        for d2 in /etc/cron.hourly /etc/cron.daily; do
+            [[ -d "$d2" ]] || continue
+            info "run-parts --test $d2"
+            run-parts --test "$d2" 2>/dev/null | sed 's/^/         /'
+        done
     fi
 }
 
@@ -1521,6 +2041,261 @@ check_network_files() {
         if (( count > 6 )); then
             warn "Many entries in /etc/securetty — consider trimming."
         fi
+    fi
+
+    sub "Filesystem mount options"
+    if command -v findmnt >/dev/null 2>&1; then
+        local mnt_hits
+        mnt_hits="$(findmnt -rn -o TARGET,OPTIONS /home /tmp /var/tmp /dev/shm 2>/dev/null || true)"
+        if [[ -n "$mnt_hits" ]]; then
+            echo "$mnt_hits" | sed 's/^/         /'
+        fi
+        while read -r target opts; do
+            [[ -n "${target:-}" ]] || continue
+            case "$target" in
+                /tmp|/var/tmp|/dev/shm)
+                    echo "$opts" | grep -q noexec || warn "$target missing noexec"
+                    echo "$opts" | grep -q nosuid || warn "$target missing nosuid"
+                    echo "$opts" | grep -q nodev || warn "$target missing nodev"
+                    ;;
+            esac
+        done <<< "$mnt_hits"
+    else
+        info "findmnt not available; inspect /etc/fstab manually."
+    fi
+}
+
+check_network_state() {
+    hdr "Network state and local-only surfaces"
+
+    sub "Host / resolver files"
+    for f in /etc/hostname /etc/hosts /etc/resolv.conf /etc/nsswitch.conf; do
+        [[ -r "$f" ]] || continue
+        info "$f"
+        head -20 "$f" 2>/dev/null | sed 's/^/         /'
+    done
+
+    sub "Interfaces and routes"
+    (ip -br addr 2>/dev/null || ip addr show 2>/dev/null || ifconfig 2>/dev/null) | sed 's/^/         /' | head -80
+    (ip route 2>/dev/null; ip -6 route 2>/dev/null; ip rule 2>/dev/null) | sed 's/^/         /' | head -80
+
+    sub "Neighbours / namespaces"
+    (ip neigh 2>/dev/null; ip netns list 2>/dev/null; ls /var/run/netns/ 2>/dev/null) | sed 's/^/         /' | head -60
+
+    sub "Local-only listeners"
+    local local_listeners
+    local_listeners="$(ss -tulpn 2>/dev/null | awk 'NR>1 && $5 ~ /127\.0\.0\.1:|::1:/ {print}' || true)"
+    if [[ -z "$local_listeners" ]]; then
+        ok "No loopback-only listeners reported by ss."
+    else
+        warn "Loopback-only listeners:"
+        echo "$local_listeners" | sed 's/^/         /'
+    fi
+
+    sub "Unix sockets"
+    local usock
+    usock="$(ss -xlp 2>/dev/null | tail -n +2 | head -80 || true)"
+    if [[ -n "$usock" ]]; then
+        echo "$usock" | sed 's/^/         /'
+    fi
+
+    sub "Raw / packet sockets"
+    local raws
+    raws="$(ss -0pb 2>/dev/null | egrep -i 'packet|raw' || true)"
+    if [[ -z "$raws" ]]; then
+        ok "No raw/packet sockets reported by ss -0pb."
+    else
+        warn "Raw/packet sockets present:"
+        echo "$raws" | sed 's/^/         /'
+    fi
+    [[ -r /proc/net/packet ]] && { info "/proc/net/packet"; sed 's/^/         /' /proc/net/packet 2>/dev/null | head -40; }
+
+    sub "Files used by network processes"
+    if command -v lsof >/dev/null 2>&1; then
+        lsof -i 2>/dev/null | head -80 | sed 's/^/         /'
+    fi
+    if command -v fuser >/dev/null 2>&1; then
+        fuser -nv tcp 22 80 443 2>/dev/null | sed 's/^/         /'
+    fi
+
+    sub "Writable docker socket"
+    if [[ -S /var/run/docker.sock ]]; then
+        info "/var/run/docker.sock exists"
+        ls -l /var/run/docker.sock 2>/dev/null | sed 's/^/         /'
+        [[ -w /var/run/docker.sock ]] && bad "Current user can write /var/run/docker.sock"
+    fi
+
+    sub "NFS exports"
+    if [[ -r /etc/exports ]]; then
+        local exports
+        exports="$(grep -vE '^\s*(#|$)' /etc/exports 2>/dev/null || true)"
+        if [[ -n "$exports" ]]; then
+            info "/etc/exports entries:"
+            echo "$exports" | sed 's/^/         /'
+            echo "$exports" | grep -qE 'no_root_squash|no_all_squash' && bad "NFS export uses no_root_squash/no_all_squash"
+        else
+            ok "/etc/exports has no active entries."
+        fi
+    fi
+
+    sub "Loopback mutex listener heuristics"
+    local mutex_hits
+    mutex_hits="$(ss -lntp 2>/dev/null | awk 'NR>1 && $4 ~ /127\.0\.0\.1:/ {split($4,a,":"); p=a[length(a)]; if (p+0 >= 1024) print $0}' | head -60 || true)"
+    if [[ -z "$mutex_hits" ]]; then
+        info "No high-port loopback listeners found in sampled output."
+    else
+        warn "High-port loopback listeners (review for mutex/backdoor patterns):"
+        echo "$mutex_hits" | sed 's/^/         /'
+    fi
+}
+
+check_network_hardening_extras() {
+    hdr "Interface / control-plane hardening"
+
+    sub "Interface inventory"
+    local link_out=""
+    link_out="$(ip -br link 2>/dev/null || ip link show 2>/dev/null || true)"
+    if [[ -n "$link_out" ]]; then
+        echo "$link_out" | sed 's/^/         /'
+        local up_no_carrier
+        up_no_carrier="$(echo "$link_out" | awk '$1 != "lo" && $0 ~ /UP/ && $0 ~ /NO-CARRIER/ {print}' || true)"
+        if [[ -n "$up_no_carrier" ]]; then
+            warn "Interfaces are administratively up but show NO-CARRIER:"
+            echo "$up_no_carrier" | sed 's/^/         /'
+        fi
+        info "Review non-loopback interfaces that are UP but not required by the README; unused interfaces should be disabled manually."
+    else
+        info "Could not enumerate interfaces."
+    fi
+
+    sub "Per-interface redirect / proxy ARP state"
+    local ifdir ifname sendr accr prox
+    for ifdir in /proc/sys/net/ipv4/conf/*; do
+        [[ -d "$ifdir" ]] || continue
+        ifname="$(basename "$ifdir")"
+        sendr="$(cat "$ifdir/send_redirects" 2>/dev/null || echo '?')"
+        accr="$(cat "$ifdir/accept_redirects" 2>/dev/null || echo '?')"
+        prox="$(cat "$ifdir/proxy_arp" 2>/dev/null || echo '?')"
+        if [[ "$sendr" == "0" && "$accr" == "0" && "$prox" == "0" ]]; then
+            ok "$ifname: send_redirects=0 accept_redirects=0 proxy_arp=0"
+        else
+            warn "$ifname: send_redirects=$sendr accept_redirects=$accr proxy_arp=$prox"
+        fi
+    done
+
+    sub "Routing / control-plane daemons"
+    local route_hits
+    route_hits="$(
+        systemctl list-unit-files --type=service --no-legend 2>/dev/null \
+            | awk '{print $1}' \
+            | grep -iE '(^|/)(frr|zebra|bgpd|ospfd|ospf6d|ripd|ripngd|babeld|bird|bird6|keepalived|radvd|mrouted|pimd|dhcpd|named)\.service$' || true
+    )"
+    if [[ -n "$route_hits" ]]; then
+        warn "Routing / infrastructure daemons present:"
+        echo "$route_hits" | sed 's/^/         /'
+    else
+        ok "No obvious routing daemons found."
+    fi
+
+    sub "Legacy network services"
+    local legacy_hits
+    legacy_hits="$(
+        systemctl list-unit-files --type=service --no-legend 2>/dev/null \
+            | awk '{print $1}' \
+            | grep -iE '(finger|fingerd|telnet|telnetd|tftp|tftpd|rsh|rsh-server|rexec|rlogin|talk|ntalk|chargen|daytime|discard|echo|inetd|xinetd|rpcbind|ypserv|snmpd)\.service$' || true
+    )"
+    if [[ -n "$legacy_hits" ]]; then
+        bad "Legacy or usually unnecessary network services present:"
+        echo "$legacy_hits" | sed 's/^/         /'
+    else
+        ok "No obvious legacy network services found."
+    fi
+
+    sub "Local management web services"
+    local mgmt_hits
+    mgmt_hits="$(
+        systemctl list-unit-files --type=service --type=socket --no-legend 2>/dev/null \
+            | awk '{print $1}' \
+            | grep -iE '(cockpit|webmin|ajenti|mini_httpd|lighttpd-admin)\.(service|socket)$' || true
+    )"
+    if [[ -n "$mgmt_hits" ]]; then
+        warn "Management web services/sockets present:"
+        echo "$mgmt_hits" | sed 's/^/         /'
+    else
+        info "No common management web services detected."
+    fi
+
+    sub "Login banner"
+    local ssh_banner=""
+    if [[ -r /etc/ssh/sshd_config ]]; then
+        ssh_banner="$(awk '/^[[:space:]]*Banner[[:space:]]+/ {print $2}' /etc/ssh/sshd_config | tail -1)"
+    fi
+    if [[ -n "$ssh_banner" && "$ssh_banner" != "none" ]]; then
+        ok "sshd Banner directive set to $ssh_banner"
+    else
+        warn "sshd Banner directive not set."
+    fi
+    for ifile in /etc/issue /etc/issue.net; do
+        if [[ -s "$ifile" ]]; then
+            ok "$ifile is non-empty"
+        else
+            warn "$ifile is missing or empty"
+        fi
+    done
+
+    sub "Rate-limiting heuristics"
+    local rl_hits=""
+    if command -v nft >/dev/null 2>&1; then
+        rl_hits="$(nft list ruleset 2>/dev/null | grep -iE 'limit rate|meter|ct count|synproxy' || true)"
+    fi
+    if [[ -z "$rl_hits" ]] && command -v iptables-save >/dev/null 2>&1; then
+        rl_hits="$(iptables-save 2>/dev/null | grep -iE -- '--limit|--hashlimit|--connlimit|--recent' || true)"
+    fi
+    if [[ -n "$rl_hits" ]]; then
+        ok "Firewall rate-limiting constructs found"
+        echo "$rl_hits" | head -20 | sed 's/^/         /'
+    else
+        info "No firewall rate-limiting heuristics found in sampled rules."
+    fi
+
+    sub "IP-options filtering heuristics"
+    local ipopt_hits=""
+    if command -v nft >/dev/null 2>&1; then
+        ipopt_hits="$(nft list ruleset 2>/dev/null | grep -iE 'ip option|ip6 nexthdr|rt0|route0' || true)"
+    fi
+    if [[ -z "$ipopt_hits" ]] && command -v iptables-save >/dev/null 2>&1; then
+        ipopt_hits="$(iptables-save 2>/dev/null | grep -iE 'ipopt|ipv4options|rt-type|lsrr|ssrr|record-route|router-alert' || true)"
+    fi
+    if [[ -n "$ipopt_hits" ]]; then
+        ok "Firewall rules contain IP-options / extension-header filtering heuristics"
+        echo "$ipopt_hits" | head -20 | sed 's/^/         /'
+    else
+        info "No explicit IP-options filtering heuristics found in sampled firewall rules."
+    fi
+
+    sub "Logging stack"
+    if systemctl is-active --quiet systemd-journald 2>/dev/null; then
+        ok "systemd-journald is active."
+    else
+        bad "systemd-journald is not active."
+    fi
+    if systemctl is-enabled --quiet rsyslog 2>/dev/null || systemctl is-active --quiet rsyslog 2>/dev/null; then
+        ok "rsyslog present."
+    else
+        info "rsyslog not active/enabled; journald may be the only logger."
+    fi
+
+    sub "NTP / time synchronization"
+    local ntp_svc=""
+    for ntp_svc in systemd-timesyncd chronyd ntpd openntpd; do
+        if systemctl is-active --quiet "$ntp_svc" 2>/dev/null; then
+            ok "$ntp_svc is active."
+        elif systemctl is-enabled --quiet "$ntp_svc" 2>/dev/null; then
+            info "$ntp_svc is enabled but not active."
+        fi
+    done
+    if command -v timedatectl >/dev/null 2>&1; then
+        timedatectl status 2>/dev/null | sed 's/^/         /' | head -20
     fi
 }
 
@@ -1599,6 +2374,16 @@ check_modules() {
     else
         echo "$mods" | sed 's/^/         /'
     fi
+
+    sub "Persistent module-load configuration"
+    local modcfg_hits=""
+    modcfg_hits="$(grep -RInE '.' /etc/modules-load.d /usr/lib/modules-load.d /run/modules-load.d 2>/dev/null || true)"
+    if [[ -z "$modcfg_hits" ]]; then
+        ok "No custom module-load entries found."
+    else
+        warn "Module-load configuration present:"
+        echo "$modcfg_hits" | sed 's/^/         /'
+    fi
 }
 
 ############################################################
@@ -1636,15 +2421,52 @@ check_aliases() {
 
 check_authorized_keys() {
     hdr "SSH authorized_keys"
+    sub "Hidden characters / trailing whitespace in SSH config files"
+    local sf
+    for sf in /etc/ssh/sshd_config /etc/ssh/ssh_config /root/.ssh/authorized_keys /home/*/.ssh/authorized_keys; do
+        [[ -e "$sf" ]] || continue
+        show_hidden_line_issues "$sf"
+    done
+
     local f
     for f in /root/.ssh/authorized_keys /home/*/.ssh/authorized_keys; do
         [[ -f "$f" ]] || continue
-        local keys
+        local keys mode owner
         keys="$(grep -vE '^\s*(#|$)' "$f" | wc -l)"
+        mode="$(stat -c '%a' "$f" 2>/dev/null)"
+        owner="$(stat -c '%U' "$f" 2>/dev/null)"
         if (( keys > 0 )); then
             warn "$f has $keys key(s)"
             grep -vE '^\s*(#|$)' "$f" | awk '{print "         " $NF}'
         fi
+        if [[ "$mode" == "600" ]]; then
+            ok "$f mode is 600"
+        else
+            bad "$f mode is ${mode:-unknown}, want 600"
+        fi
+        note "owner=$owner"
+    done
+
+    sub "SSH private/public key files"
+    for f in /root/.ssh/id_* /home/*/.ssh/id_*; do
+        [[ -f "$f" ]] || continue
+        case "$(basename "$f")" in
+            *.pub)
+                if [[ "$(stat -c '%a' "$f" 2>/dev/null)" == "644" ]]; then
+                    ok "$f mode is 644"
+                else
+                    bad "$f mode is $(stat -c '%a' "$f" 2>/dev/null), want 644"
+                fi
+                ;;
+            *)
+                if [[ "$(stat -c '%a' "$f" 2>/dev/null)" == "600" ]]; then
+                    ok "$f mode is 600"
+                else
+                    bad "$f mode is $(stat -c '%a' "$f" 2>/dev/null), want 600"
+                fi
+                note "owner=$(stat -c '%U' "$f" 2>/dev/null)"
+                ;;
+        esac
     done
 }
 
@@ -1870,6 +2692,17 @@ check_security_tools() {
         warn "auditd not active."
     fi
 
+    sub "System logger"
+    if command -v systemctl >/dev/null; then
+        if systemctl is-active --quiet rsyslog 2>/dev/null; then
+            ok "rsyslog is active."
+        elif systemctl is-active --quiet syslog-ng 2>/dev/null; then
+            ok "syslog-ng is active."
+        else
+            info "No classic syslog daemon active (may rely on journald only)."
+        fi
+    fi
+
     sub "fail2ban"
     if command -v systemctl >/dev/null && systemctl is-active --quiet fail2ban 2>/dev/null; then
         ok "fail2ban is active."
@@ -1897,6 +2730,94 @@ check_security_tools() {
     fi
     if command -v getenforce >/dev/null 2>&1; then
         info "SELinux: $(getenforce)"
+    fi
+
+    sub "eBPF telemetry"
+    if command -v bpftool >/dev/null 2>&1; then
+        local bpfp
+        bpfp="$(bpftool prog 2>/dev/null | head -120 || true)"
+        if [[ -z "$bpfp" ]]; then
+            info "bpftool present but no program list returned."
+        else
+            info "bpftool prog:"
+            echo "$bpfp" | sed 's/^/         /'
+        fi
+    else
+        info "bpftool not installed."
+    fi
+    if command -v ebpfmon >/dev/null 2>&1; then
+        warn "ebpfmon installed."
+    fi
+
+    sub "Journald triage"
+    if command -v journalctl >/dev/null 2>&1; then
+        info "journalctl --disk-usage:"
+        journalctl --disk-usage 2>/dev/null | sed 's/^/         /'
+        info "journalctl --list-boots:"
+        journalctl --list-boots 2>/dev/null | tail -10 | sed 's/^/         /'
+        info "Recent high-priority journal entries:"
+        journalctl -p err -n 30 --no-pager 2>/dev/null | sed 's/^/         /'
+    else
+        info "journalctl not installed."
+    fi
+}
+
+check_package_integrity() {
+    hdr "Package integrity / tampering"
+
+    case "$PKG_MGR" in
+        dnf|yum|zypper)
+            if command -v rpm >/dev/null 2>&1; then
+                local rv
+                rv="$(rpm -Va 2>/dev/null | head -80 || true)"
+                if [[ -z "$rv" ]]; then
+                    ok "rpm -Va returned no differences."
+                else
+                    warn "rpm -Va reported package differences:"
+                    echo "$rv" | sed 's/^/         /'
+                    info "Investigate modified binaries and configs; reinstall tampered packages where appropriate."
+                fi
+            fi
+            ;;
+        apt)
+            if command -v debsums >/dev/null 2>&1; then
+                local ds
+                ds="$(debsums -as 2>/dev/null | head -80 || true)"
+                if [[ -z "$ds" ]]; then
+                    ok "debsums reported no modified package files."
+                else
+                    warn "debsums reported package mismatches:"
+                    echo "$ds" | sed 's/^/         /'
+                fi
+            else
+                info "debsums not installed."
+            fi
+            ;;
+    esac
+
+    sub "Restricted-shell binaries on disk"
+    local rbash_hits
+    rbash_hits="$(find /usr/bin /bin /usr/local/bin -maxdepth 1 \( -name 'rbash' -o -name 'rksh' -o -name 'rzsh' \) 2>/dev/null || true)"
+    if [[ -z "$rbash_hits" ]]; then
+        ok "No restricted-shell binaries found in common bin paths."
+    else
+        warn "Restricted-shell binaries found:"
+        echo "$rbash_hits" | sed 's/^/         /'
+    fi
+
+    sub "RPATH / RUNPATH in local executables"
+    if command -v readelf >/dev/null 2>&1; then
+        local rpaths=""
+        while IFS= read -r ef; do
+            readelf -d "$ef" 2>/dev/null | grep -qE 'RPATH|RUNPATH' || continue
+            rpaths+="$ef"$'\n'
+        done < <(find /usr/local/bin /usr/local/sbin /opt -xdev -type f -perm -111 2>/dev/null | head -80)
+        if [[ -z "$rpaths" ]]; then
+            info "No sampled RPATH/RUNPATH entries found in local executables."
+        else
+            warn "Executables with RPATH/RUNPATH:"
+            echo "$rpaths" | sed '/^$/d; s/^/         /'
+        fi
     fi
 }
 
@@ -1952,6 +2873,17 @@ check_firefox_prefs() {
         fi
     done
     (( found )) || info "No Firefox prefs.js files found."
+
+    sub "Firefox extensions"
+    local extdir
+    found=0
+    for extdir in /root/.mozilla/firefox/*.default*/extensions /home/*/.mozilla/firefox/*.default*/extensions; do
+        [[ -d "$extdir" ]] || continue
+        found=1
+        warn "$extdir:"
+        find "$extdir" -maxdepth 2 -type f \( -name '*.xpi' -o -name 'manifest.json' \) 2>/dev/null | sed 's/^/         /'
+    done
+    (( found )) || info "No Firefox extension directories found."
 }
 
 check_seafile() {
@@ -2052,6 +2984,45 @@ check_seafile() {
     (( init_found )) || info "No Seafile init scripts found in /etc/init.d."
 }
 
+check_freeipa() {
+    hdr "FreeIPA / Kerberos"
+
+    sub "Core config files"
+    local f
+    for f in /etc/krb5.conf /etc/ipa/default.conf /etc/krb5.keytab; do
+        [[ -e "$f" ]] || continue
+        info "$f"
+        ls -l "$f" 2>/dev/null | sed 's/^/         /'
+        if [[ -r "$f" && "$f" != "/etc/krb5.keytab" ]]; then
+            head -40 "$f" 2>/dev/null | sed 's/^/         /'
+        fi
+    done
+
+    sub "Kerberos / IPA env vars"
+    env | grep -E '^(KRB5CCNAME|KRB5_KTNAME|KRB5_CONFIG|KRB5_KDC_PROFILE|KRB5RCACHETYPE|KRB5RCACHEDIR|KRB5_TRACE|KRB5_CLIENT_KTNAME|KPROP_PORT)=' | sed 's/^/         /'
+
+    sub "Ticket caches and key material"
+    find /tmp /run/user -maxdepth 2 -type f \( -name 'krb5cc*' -o -name '*.ccache' -o -name '*.keytab' \) 2>/dev/null | sed 's/^/         /' | head -120
+    find /home /root -maxdepth 3 -type d -name '.gnupg' 2>/dev/null | sed 's/^/         /'
+
+    sub "Kerberos / IPA binaries"
+    command -v ipa kdestroy kinit klist kpasswd ksu kswitch kvno ldapsearch 2>/dev/null | sed 's/^/         /'
+
+    sub "Current Kerberos tickets"
+    if command -v klist >/dev/null 2>&1; then
+        klist 2>/dev/null | sed 's/^/         /'
+    fi
+    if command -v keyctl >/dev/null 2>&1; then
+        keyctl show 2>/dev/null | sed 's/^/         /'
+    fi
+
+    sub "FreeIPA / LDAP ports"
+    ss -tulpn 2>/dev/null | awk 'NR>1 && $5 ~ /:(88|389|464|636|7389|9443)$/ {print "         " $0}'
+
+    sub "Domain-related files"
+    find /etc /var/lib/ipa /var/log -maxdepth 3 \( -name '*ipa*' -o -name '*krb5*' -o -name '*sssd*' \) 2>/dev/null | sed 's/^/         /' | head -120
+}
+
 ############################################################
 # CHECKS - Browser hints (informational)
 ############################################################
@@ -2101,6 +3072,36 @@ check_pam_backdoors() {
             find "$d" -type f -newer /etc/hostname 2>/dev/null | sed 's/^/         /'
         fi
     done
+
+    sub "pam_exec / expose_authtok abuse"
+    local pexec
+    pexec="$(grep -RInE 'pam_exec\.so|expose_authtok' /etc/pam.d 2>/dev/null || true)"
+    if [[ -z "$pexec" ]]; then
+        ok "No pam_exec/expose_authtok references found in /etc/pam.d."
+    else
+        bad "PAM exec hooks or expose_authtok directives present:"
+        echo "$pexec" | sed 's/^/         /'
+    fi
+
+    sub "Suspicious PAM helper scripts"
+    local pamhelpers
+    pamhelpers="$(find /usr/local/bin /usr/local/sbin /opt /tmp /var/tmp /dev/shm -maxdepth 3 -type f \
+        \( -name '*.sh' -o -name '*secret*' -o -name '*auth*' \) 2>/dev/null | head -80 || true)"
+    if [[ -n "$pamhelpers" ]]; then
+        info "Potential PAM helper scripts in writable/common paths:"
+        echo "$pamhelpers" | sed 's/^/         /'
+    fi
+
+    sub "pam_unix shared object metadata"
+    local pam_unix_so
+    pam_unix_so="$(find /lib /usr/lib -type f -name 'pam_unix.so' 2>/dev/null | head -1)"
+    if [[ -n "$pam_unix_so" ]]; then
+        info "$pam_unix_so"
+        ls -l "$pam_unix_so" 2>/dev/null | sed 's/^/         /'
+        if command -v strings >/dev/null 2>&1; then
+            strings "$pam_unix_so" 2>/dev/null | grep -iE 'backdoor|masterpass|letmein|password' | head -20 | sed 's/^/         /'
+        fi
+    fi
 }
 
 check_ld_preload() {
@@ -2144,6 +3145,27 @@ check_ld_preload() {
             grep -n "LD_PRELOAD" "$f" | sed 's/^/         /'
         fi
     done
+
+    sub "ld.so search path configuration"
+    for f in /etc/ld.so.conf /etc/ld.so.conf.d/*.conf; do
+        [[ -f "$f" ]] || continue
+        info "$f"
+        sed 's/^/         /' "$f" 2>/dev/null | head -20
+        [[ -w "$f" ]] && bad "$f is writable"
+    done
+
+    sub "Writable library search directories"
+    local libdirs=""
+    while IFS= read -r line; do
+        [[ -d "$line" ]] || continue
+        [[ -w "$line" ]] && libdirs+="$line"$'\n'
+    done < <(grep -hEv '^\s*(#|include|$)' /etc/ld.so.conf /etc/ld.so.conf.d/*.conf 2>/dev/null | xargs -r -n1 echo)
+    if [[ -z "$libdirs" ]]; then
+        ok "No writable library search directories found from ld.so config."
+    else
+        bad "Writable library search directories:"
+        echo "$libdirs" | sed '/^$/d; s/^/         /'
+    fi
 }
 
 check_motd_persistence() {
@@ -2211,6 +3233,16 @@ check_polkit() {
             [[ -f "$f" ]] && warn "polkit pkla file: $f"
         done
     fi
+
+    sub "D-Bus policy files"
+    local dbus_hits
+    dbus_hits="$(grep -RInE '<allow|own=|send_destination=|send_interface=' /etc/dbus-1 /usr/share/dbus-1 2>/dev/null | head -80 || true)"
+    if [[ -z "$dbus_hits" ]]; then
+        info "No D-Bus policy hits found in sampled output."
+    else
+        info "D-Bus policy snippets:"
+        echo "$dbus_hits" | sed 's/^/         /'
+    fi
 }
 
 check_tmpfiles() {
@@ -2267,6 +3299,68 @@ check_systemd_units() {
         done
     fi
 
+    sub "Writable service/timer/socket files and drop-ins"
+    local sysd_hits
+    sysd_hits="$(find /etc/systemd/system \
+        \( -name '*.service' -o -name '*.timer' -o -name '*.socket' -o -path '*/.d/*.conf' \) \
+        -writable 2>/dev/null || true)"
+    if [[ -z "$sysd_hits" ]]; then
+        ok "No writable systemd units or drop-ins in /etc/systemd/system."
+    else
+        bad "Writable systemd units / drop-ins found:"
+        echo "$sysd_hits" | sed 's/^/         /'
+    fi
+
+    sub "systemd ExecStart/User overrides"
+    local dropins
+    dropins="$(grep -RInE '^(ExecStart|User)=' /etc/systemd/system 2>/dev/null || true)"
+    if [[ -z "$dropins" ]]; then
+        ok "No ExecStart/User overrides found under /etc/systemd/system."
+    else
+        warn "systemd overrides present:"
+        echo "$dropins" | sed 's/^/         /'
+    fi
+
+    sub "systemd Environment= secrets"
+    local envlines
+    envlines="$(grep -RInE '^Environment=.*(PASS|PWD|TOKEN|SECRET|KEY|AUTH|USER)' /etc/systemd/system /lib/systemd/system /usr/lib/systemd/system 2>/dev/null || true)"
+    if [[ -z "$envlines" ]]; then
+        info "No obvious secret-bearing Environment= lines found."
+    else
+        bad "Secret-like Environment= entries found in systemd units:"
+        echo "$envlines" | sed 's/^/         /'
+    fi
+
+    sub "Relative ExecStart usage"
+    local rel_exec
+    rel_exec="$(grep -RInE '^Exec(Start|Stop|Reload)=[^/]' /etc/systemd/system /usr/lib/systemd/system /lib/systemd/system 2>/dev/null || true)"
+    if [[ -z "$rel_exec" ]]; then
+        ok "No relative ExecStart/ExecStop/ExecReload entries found."
+    else
+        warn "Relative-path systemd commands found:"
+        echo "$rel_exec" | sed 's/^/         /'
+        if command -v systemctl >/dev/null 2>&1; then
+            info "systemd environment:"
+            systemctl show-environment 2>/dev/null | sed 's/^/         /'
+        fi
+    fi
+
+    sub "Writable binaries referenced by units"
+    local unit_bins=""
+    while IFS= read -r execpath; do
+        [[ -n "$execpath" ]] || continue
+        execpath="${execpath%% *}"
+        [[ "$execpath" == /* && -e "$execpath" ]] || continue
+        [[ -w "$execpath" ]] && unit_bins+="$execpath"$'\n'
+    done < <(grep -RhoE '^Exec(Start|Stop|Reload|StartPre|StartPost|StopPre|StopPost)=/[^ ]+' \
+        /etc/systemd/system /usr/lib/systemd/system /lib/systemd/system 2>/dev/null | cut -d= -f2)
+    if [[ -z "$unit_bins" ]]; then
+        ok "No writable unit binaries found."
+    else
+        bad "Writable binaries referenced by units:"
+        echo "$unit_bins" | sed '/^$/d; s/^/         /'
+    fi
+
     sub "systemd-sockets"
     if command -v systemctl >/dev/null; then
         systemctl list-sockets --no-legend --no-pager 2>/dev/null | sed 's/^/         /'
@@ -2290,6 +3384,10 @@ check_docker() {
 
     if ! command -v docker >/dev/null 2>&1 && ! pkg_is_installed docker && ! pkg_is_installed docker.io && ! pkg_is_installed docker-ce; then
         info "Docker not installed."
+        sub "Container runtimes"
+        for rt in ctr runc crictl podman; do
+            command -v "$rt" >/dev/null 2>&1 && warn "$rt present"
+        done
         return
     fi
 
@@ -2340,6 +3438,11 @@ check_docker() {
         if grep -q '"auths"' "$cfg" 2>/dev/null; then
             warn "$cfg has stored 'auths' (registry credentials)"
         fi
+    done
+
+    sub "Container runtimes"
+    for rt in ctr runc crictl podman; do
+        command -v "$rt" >/dev/null 2>&1 && warn "$rt present"
     done
 }
 
@@ -2462,6 +3565,13 @@ check_pkexec() {
 check_rclocal_extras() {
     hdr "Boot-time persistence (extras)"
 
+    sub "Hidden characters / trailing whitespace in startup files"
+    local hf
+    for hf in /etc/rc.local /etc/profile /etc/environment /etc/crontab /etc/hosts /etc/host.conf; do
+        [[ -e "$hf" ]] || continue
+        show_hidden_line_issues "$hf"
+    done
+
     sub "/etc/init.d/ custom scripts"
     if [[ -d /etc/init.d ]]; then
         local f
@@ -2497,6 +3607,14 @@ check_rclocal_extras() {
         info "$d:"
         ls "$d" 2>/dev/null | sed 's/^/         /'
     done
+
+    sub "User systemd services"
+    local udir
+    for udir in /home/*/.config/systemd/user /root/.config/systemd/user; do
+        [[ -d "$udir" ]] || continue
+        warn "$udir:"
+        find "$udir" -maxdepth 2 -type f \( -name '*.service' -o -name '*.timer' \) 2>/dev/null | sed 's/^/         /'
+    done
 }
 
 check_bash_history_secrets() {
@@ -2515,6 +3633,141 @@ check_bash_history_secrets() {
             warn "  contains potential secrets (Bearer token, password=, api_key, secret=)"
         fi
     done
+}
+
+check_sessions_and_local_artifacts() {
+    hdr "Sessions, clipboard, and local artifacts"
+
+    sub "screen / tmux sessions"
+    command -v screen >/dev/null 2>&1 && screen -ls 2>/dev/null | sed 's/^/         /'
+    command -v tmux >/dev/null 2>&1 && tmux ls 2>/dev/null | sed 's/^/         /'
+
+    sub "Clipboard"
+    if command -v xclip >/dev/null 2>&1; then
+        note "clipboard: $(xclip -o -selection clipboard 2>/dev/null | head -c 200)"
+    elif command -v xsel >/dev/null 2>&1; then
+        note "clipboard: $(xsel -ob 2>/dev/null | head -c 200)"
+    else
+        info "xclip/xsel not installed."
+    fi
+
+    sub "doas"
+    if command -v doas >/dev/null 2>&1 || [[ -f /etc/doas.conf ]]; then
+        warn "doas present."
+        [[ -r /etc/doas.conf ]] && sed 's/^/         /' /etc/doas.conf 2>/dev/null
+    else
+        ok "doas not present."
+    fi
+
+    sub "Audit / auth log hints"
+    if command -v aureport >/dev/null 2>&1; then
+        aureport --tty 2>/dev/null | grep -E 'su |sudo ' | head -40 | sed 's/^/         /'
+    fi
+    grep -RE 'comm="su"|comm="sudo"' /var/log* 2>/dev/null | head -40 | sed 's/^/         /'
+
+    sub "Zero-byte pid/lock artifacts"
+    find /var/run /run -maxdepth 1 -type f \( -name '*.pid' -o -name '*.lock' \) -size 0c 2>/dev/null | head -80 | sed 's/^/         /'
+}
+
+check_interesting_files() {
+    hdr "Interesting files and writable execution paths"
+
+    sub "Writables in common execution paths"
+    local writable_exec
+    writable_exec="$(find /usr/local/bin /usr/local/sbin /usr/bin /usr/sbin /bin /sbin \
+        -xdev \( -type f -o -type d \) -writable 2>/dev/null || true)"
+    if [[ -z "$writable_exec" ]]; then
+        ok "No writable files/directories in common execution paths."
+    else
+        bad "Writable files/directories in execution paths:"
+        echo "$writable_exec" | sed 's/^/         /'
+    fi
+
+    sub "Recently modified files in sensitive paths"
+    find /etc /usr/local /opt /var/www /home -xdev -type f -mtime -7 2>/dev/null | head -80 | sed 's/^/         /'
+
+    sub "SQLite databases"
+    find /home /root /var/www -xdev -type f \( -name '*.sqlite' -o -name '*.sqlite3' -o -name '*.db' \) 2>/dev/null | head -80 | sed 's/^/         /'
+
+    sub "Backup / secret-like files"
+    find /home /root /etc /var/www -xdev -type f \( \
+        -name '*.bak' -o -name '*.old' -o -name '*.orig' -o -name '*~' -o \
+        -iname 'secret*' -o -iname '*password*' -o -iname '*.kdbx' \
+    \) 2>/dev/null | head -80 | sed 's/^/         /'
+
+    sub "Shell/profile files"
+    find /etc /root /home -xdev -type f \( \
+        -name '.profile' -o -name '.bash_profile' -o -name '.bash_login' -o \
+        -name '.bashrc' -o -name '.zshrc' -o -name '.zlogin' -o \
+        -path '/etc/profile' -o -path '/etc/profile.d/*' \
+    \) 2>/dev/null | head -120 | sed 's/^/         /'
+
+    sub "Password/hash related system files"
+    for f in /etc/passwd /etc/pwd.db /etc/master.passwd /etc/group /etc/shadow /etc/shadow- /etc/shadow~ /etc/gshadow /etc/gshadow- /etc/security/opasswd; do
+        [[ -e "$f" ]] || continue
+        info "$f"
+        ls -l "$f" 2>/dev/null | sed 's/^/         /'
+    done
+
+    sub "High-value filename patterns"
+    find / -xdev -type f \( \
+        -name '*_history' -o -name '.sudo_as_admin_successful' -o -name '.htpasswd' -o \
+        -name '.git-credentials' -o -name '.rhosts' -o -name 'hosts.equiv' -o \
+        -name 'Dockerfile' -o -name 'docker-compose.yml' -o -name 'docker-compose.yaml' \
+    \) 2>/dev/null | head -120 | sed 's/^/         /'
+
+    sub "High-value credential artifacts in home dirs"
+    find /root /home -xdev \( \
+        -path '*/.gnupg' -o -path '*/.aws' -o -path '*/.kube' -o -path '*/.docker' -o \
+        -path '*/.config/containers' -o -path '*/.local/share/keyrings' -o -path '*/.kde/share/apps/kwallet' -o \
+        -name '.netrc' -o -name '.npmrc' -o -name '.pypirc' -o \
+        -name '.mysql_history' -o -name '.psql_history' -o -name '.sqlite_history' \
+    \) 2>/dev/null | head -160 | sed 's/^/         /'
+
+    sub "GPG-encrypted files and keyrings"
+    find /root /home -xdev \( -name '*.gpg' -o -path '*/.gnupg/*' \) 2>/dev/null | head -160 | sed 's/^/         /'
+
+    sub "Credential regex triage in user configs"
+    grep -RInE 'password|token|secret|api[_-]?key|aws_access_key_id|aws_secret_access_key' \
+        /root/.git-credentials /root/.netrc /root/.npmrc /root/.pypirc /root/.aws /root/.kube /root/.docker /root/.config \
+        /home/*/.git-credentials /home/*/.netrc /home/*/.npmrc /home/*/.pypirc /home/*/.aws /home/*/.kube /home/*/.docker /home/*/.config \
+        2>/dev/null | head -120 | sed 's/^/         /'
+
+    sub "Hidden files"
+    find / -xdev -type f -name '.*' 2>/dev/null | head -120 | sed 's/^/         /'
+
+    sub "Root-owned files in home directories"
+    find /home -xdev -user root 2>/dev/null | head -120 | sed 's/^/         /'
+
+    sub "Mail / backups / exports"
+    find /var/backups /var/mail /var/spool/mail -maxdepth 2 2>/dev/null | sed 's/^/         /' | head -120
+    [[ -r /etc/exports ]] && sed 's/^/         /' /etc/exports 2>/dev/null | head -40
+
+    sub "Web roots"
+    find /var/www /srv/www /usr/local/www /opt/lampp/htdocs -maxdepth 3 2>/dev/null | head -120 | sed 's/^/         /'
+
+    sub "RedHat/CentOS network scripts"
+    if [[ -d /etc/sysconfig/network-scripts ]]; then
+        find /etc/sysconfig/network-scripts -maxdepth 1 -type f 2>/dev/null | sed 's/^/         /'
+        local nsbad
+        nsbad="$(grep -RInE '^NAME=.*[[:space:]]+/' /etc/sysconfig/network-scripts 2>/dev/null || true)"
+        if [[ -n "$nsbad" ]]; then
+            bad "Suspicious whitespace/command-like NAME entries in network-scripts:"
+            echo "$nsbad" | sed 's/^/         /'
+        fi
+    fi
+
+    sub "Suspicious whitespace / control chars in critical config dirs"
+    local weird_cfg
+    weird_cfg="$(LC_ALL=C grep -RInP '[[:cntrl:]]|[[:space:]]+$' \
+        /etc/passwd /etc/group /etc/shadow /etc/gshadow /etc/ssh /etc/systemd/system /etc/cron.d /etc/sudoers /etc/sudoers.d \
+        2>/dev/null | head -120 || true)"
+    if [[ -z "$weird_cfg" ]]; then
+        ok "No sampled hidden-char issues in critical config paths."
+    else
+        warn "Critical config paths with control chars / trailing whitespace:"
+        echo "$weird_cfg" | sed 's/^/         /'
+    fi
 }
 
 check_git_repos() {
@@ -2754,7 +4007,7 @@ print_summary() {
     echo "  ${C_YELLOW}WARN  : $COUNT_WARN${C_RESET}"
     echo "  ${C_RED}BAD   : $COUNT_BAD${C_RESET}"
     echo "  ${C_BLUE}INFO  : $COUNT_INFO${C_RESET}"
-    if [[ "$MODE" == "fix" ]]; then
+    if [[ "$MODE" == "fix" || "$MODE" == "fix-safe" ]]; then
         echo "  ${C_MAGENTA}FIXED : $COUNT_FIXED${C_RESET}"
         echo
         echo "  Action log: $ACTION_LOG"
@@ -2774,6 +4027,7 @@ main() {
     case "${1:-}" in
         ""|--audit) MODE="audit" ;;
         --fix) MODE="fix" ;;
+        --fix-safe) MODE="fix-safe" ;;
         --rollback) MODE="rollback"; do_rollback ""; exit 0 ;;
         --rollback-all) MODE="rollback-all"; do_rollback "all"; exit 0 ;;
         --list-backups|--list) list_backups; exit 0 ;;
@@ -2790,11 +4044,12 @@ main() {
     fi
 
     # In fix mode, snapshot logs first
-    if [[ "$MODE" == "fix" ]]; then
+    if [[ "$MODE" == "fix" || "$MODE" == "fix-safe" ]]; then
         preserve_logs
     fi
 
     find_and_parse_readme
+    check_system_info_exposure
     check_users_and_admins
     check_sudoers
     check_password_policy
@@ -2812,12 +4067,16 @@ main() {
     check_suid_sgid
     check_world_writable
     check_no_owner
+    check_capabilities_and_acls
     check_services
     check_prohibited_packages
     check_pkg_mgr_config
+    check_package_integrity
     check_display_manager
     check_scheduled
     check_network_files
+    check_network_state
+    check_network_hardening_extras
     check_boot
     check_rclocal_extras
     check_modules
@@ -2827,6 +4086,7 @@ main() {
     check_nginx
     check_mysql
     check_database_users
+    check_freeipa
     check_seafile
     check_vsftpd
     check_samba
@@ -2837,6 +4097,8 @@ main() {
     check_security_tools
     check_score_specific_services
     check_bash_history_secrets
+    check_sessions_and_local_artifacts
+    check_interesting_files
     check_git_repos
     check_forensics_questions
     check_prohibited_files
